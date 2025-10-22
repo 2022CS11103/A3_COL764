@@ -1,0 +1,71 @@
+================================================================================
+TASK 1 ANALYSIS REPORT
+================================================================================
+
+1. OVERALL OBSERVATIONS:
+--------------------------------------------------------------------------------
+
+NDCG@1:
+  - Average Improvement: 27.56%
+  - Maximum Improvement: 30.20% (at k=10)
+
+NDCG@5:
+  - Average Improvement: 28.17%
+  - Maximum Improvement: 33.64% (at k=100)
+
+NDCG@10:
+  - Average Improvement: 26.72%
+  - Maximum Improvement: 37.02% (at k=150)
+
+MRR@10:
+  - Average Improvement: 14.02%
+  - Maximum Improvement: 17.43% (at k=100)
+
+
+2. K-VALUE ANALYSIS:
+--------------------------------------------------------------------------------
+
+k=10:
+  Average Improvement across all metrics: 19.58%
+  NDCG@1: 0.3533 → 0.4600 (+30.20%)
+  NDCG@5: 0.2934 → 0.3592 (+22.43%)
+  NDCG@10: 0.2850 → 0.3190 (+11.93%)
+  MRR@10: 0.5340 → 0.6074 (+13.75%)
+
+k=20:
+  Average Improvement across all metrics: 18.57%
+  NDCG@1: 0.3533 → 0.4267 (+20.78%)
+  NDCG@5: 0.2934 → 0.3664 (+24.88%)
+  NDCG@10: 0.2850 → 0.3407 (+19.54%)
+  MRR@10: 0.5340 → 0.5824 (+9.06%)
+
+k=50:
+  Average Improvement across all metrics: 24.52%
+  NDCG@1: 0.3533 → 0.4467 (+26.44%)
+  NDCG@5: 0.2934 → 0.3752 (+27.88%)
+  NDCG@10: 0.2850 → 0.3718 (+30.46%)
+  MRR@10: 0.5340 → 0.6051 (+13.31%)
+
+k=100:
+  Average Improvement across all metrics: 28.99%
+  NDCG@1: 0.3533 → 0.4600 (+30.20%)
+  NDCG@5: 0.2934 → 0.3921 (+33.64%)
+  NDCG@10: 0.2850 → 0.3838 (+34.67%)
+  MRR@10: 0.5340 → 0.6271 (+17.43%)
+
+k=150:
+  Average Improvement across all metrics: 28.94%
+  NDCG@1: 0.3533 → 0.4600 (+30.20%)
+  NDCG@5: 0.2934 → 0.3873 (+32.00%)
+  NDCG@10: 0.2850 → 0.3905 (+37.02%)
+  MRR@10: 0.5340 → 0.6223 (+16.54%)
+
+
+3. KEY FINDINGS:
+--------------------------------------------------------------------------------
+
+- Best k value overall: k=100 (avg improvement: 28.99%)
+- BERT reranking consistently improves over BM25 across all metrics
+- Improvement is most significant for NDCG@1 (early precision)
+
+================================================================================
