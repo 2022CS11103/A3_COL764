@@ -1,271 +1,187 @@
 import os
-import json
-import numpy as np
-import pickle
-import time
-from collections import defaultdict
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from typing import Dict, List, Tuple
 from pyserini.search.lucene import LuceneSearcher
-import ir_datasets
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import numpy as np
+from tqdm import tqdm
 
 
-MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-12-v2"  
-DATASET_NAME = "msmarco-passage/trec-dl-hard"
-K_VALUES = [10, 20, 50, 100]  
-BATCH_SIZE = 32
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+class BERTReranker:
+    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Loading model: {model_name}")
+        print(f"Using device: {self.device}")
 
-print(f"Using device: {DEVICE}")
-print(f"CUDA available: {torch.cuda.is_available()}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.model.to(self.device)
+        self.model.eval()
 
-print("\n[STEP 1] Loading TREC-DL-Hard dataset...")
-start_time = time.time()
+        self.model_name = model_name
+        self.max_length = 512  # BERT's max input length
 
-dataset = ir_datasets.load(DATASET_NAME)
-queries = {}
-qrels = {}
+    def chunk_document(self, text: str, max_tokens: int = 450) -> List[str]:
+        """Split long documents into smaller chunks for BERT scoring."""
+        tokens = self.tokenizer.tokenize(text)
+        if len(tokens) <= max_tokens:
+            return [text]
+        chunks = []
+        for i in range(0, len(tokens), max_tokens):
+            chunk_tokens = tokens[i:i + max_tokens]
+            chunk_text = self.tokenizer.convert_tokens_to_string(chunk_tokens)
+            chunks.append(chunk_text)
+        return chunks
 
-for query in dataset.queries_iter():
-    queries[query.query_id] = query.text
+    def score_query_doc_pair(self, query: str, document: str) -> float:
+        """Compute relevance score between query and document."""
+        chunks = self.chunk_document(document)
+        if len(chunks) == 1:
+            inputs = self.tokenizer(
+                query,
+                document,
+                return_tensors='pt',
+                max_length=self.max_length,
+                truncation=True,
+                padding=True
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                score = outputs.logits[0][0].item()
+            return score
+        else:
+            # MAX aggregation for multiple chunks
+            chunk_scores = []
+            for chunk in chunks:
+                inputs = self.tokenizer(
+                    query,
+                    chunk,
+                    return_tensors='pt',
+                    max_length=self.max_length,
+                    truncation=True,
+                    padding=True
+                )
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                    score = outputs.logits[0][0].item()
+                    chunk_scores.append(score)
+            return max(chunk_scores)
 
-for qrel in dataset.qrels_iter():
-    if qrel.query_id not in qrels:
-        qrels[qrel.query_id] = {}
-    qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
-
-print(f"✓ Loaded {len(queries)} queries in {time.time() - start_time:.2f}s")
-print(f"✓ Loaded qrels for {len(qrels)} queries")
-
-sample_qid = list(queries.keys())[0]
-print(f"\nSample query {sample_qid}: {queries[sample_qid][:80]}...")
-
-rel_dist = defaultdict(int)
-for qid in qrels:
-    for doc_id, rel in qrels[qid].items():
-        rel_dist[rel] += 1
-
-print(f"\nRelevance distribution:")
-for rel_val in sorted(rel_dist.keys()):
-    print(f"  Relevance {rel_val}: {rel_dist[rel_val]} documents")
+    def rerank(self, query: str, candidates: List[Tuple[str, str, float]]) -> List[Tuple[str, float]]:
+        """Rerank a list of BM25 candidate documents."""
+        reranked = []
+        for doc_id, doc_text, _ in tqdm(candidates, desc="Reranking", leave=False):
+            score = self.score_query_doc_pair(query, doc_text)
+            reranked.append((doc_id, score))
+        reranked.sort(key=lambda x: x[1], reverse=True)
+        return reranked
 
 
-print("\n[STEP 2] Initializing BM25 retriever with MS-MARCO index...")
+def load_queries(query_path: str) -> Dict[str, str]:
+    """Load queries from a TSV file."""
+    queries = {}
+    with open(query_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2:
+                queries[parts[0]] = parts[1]
+    return queries
 
-try:
-    searcher = LuceneSearcher.from_prebuilt_index("msmarco-passage")
-    print("✓ Successfully loaded pre-built MS-MARCO index")
-except Exception as e:
-    print(f"✗ Error loading index: {e}")
-    print("Make sure you have internet connection and pyserini is properly installed")
-    exit(1)
 
-
-print(f"\n[STEP 3] Loading BERT model: {MODEL_NAME}...")
-start_time = time.time()
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
-model = model.to(DEVICE)
-model.eval()
-
-print(f"✓ Model loaded successfully in {time.time() - start_time:.2f}s")
-
-def retrieve_topk(query_id, query_text, k):
-    """Retrieve top-k documents using BM25"""
-    try:
-        hits = searcher.search(query_text, k=k)
-        retrieved_docs = []
+def retrieve_bm25(searcher: LuceneSearcher, queries: Dict[str, str], k: int) -> Dict[str, List[Tuple[str, str, float]]]:
+    """Retrieve top-k BM25 candidates for each query."""
+    results = {}
+    print(f"Retrieving top-{k} candidates using BM25...")
+    for qid, qtext in tqdm(queries.items(), desc="BM25 Retrieval"):
+        hits = searcher.search(qtext, k=k)
+        candidates = []
         for hit in hits:
             doc_id = hit.docid
-            score = hit.score
-            retrieved_docs.append({
-                'doc_id': doc_id,
-                'bm25_score': score,
-                'rank': len(retrieved_docs) + 1
-            })
-        return retrieved_docs
-    except Exception as e:
-        print(f"Error retrieving for query {query_id}: {e}")
-        return []
+            try:
+                doc_text = searcher.doc(doc_id).raw()
+            except Exception:
+                doc_text = searcher.doc(doc_id).contents()
+            candidates.append((doc_id, doc_text, hit.score))
+        results[qid] = candidates
+    return results
 
-def rerank_with_bert(query_text, retrieved_docs, batch_size=BATCH_SIZE):
-    """Rerank documents using BERT cross-encoder"""
-    if not retrieved_docs:
-        return retrieved_docs
-    
-    pairs = []
-    for doc in retrieved_docs:
-        try:
-            doc_raw = searcher.doc(doc['doc_id']).raw()
-            if '\n' in doc_raw:
-                doc_text = doc_raw.split('\n', 1)[1]
-            else:
-                doc_text = doc_raw
-            pairs.append((query_text, doc_text))
-        except Exception as e:
-            
-            pairs.append((query_text, ""))
-    
-    scores = []
 
-    for i in range(0, len(pairs), batch_size):
-        batch_pairs = pairs[i:i + batch_size]
-  
-        inputs = tokenizer(
-            [p[0] for p in batch_pairs],
-            [p[1] for p in batch_pairs],
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors='pt'
-        )
-        
-        inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+def write_trec_output(results: Dict[str, List[Tuple[str, float]]], output_file: str, run_name: str = "run"):
+    """Write results in TREC format."""
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for qid, doc_scores in results.items():
+            for rank, (doc_id, score) in enumerate(doc_scores[:10], start=1):
+                f.write(f"{qid}\tQ0\t{doc_id}\t{rank}\t{score}\t{run_name}\n")
 
-        with torch.no_grad():
-            outputs = model(**inputs)
-            if outputs.logits.shape[1] == 1:
-                batch_scores = outputs.logits[:, 0].cpu().numpy()
-            else:
-                batch_scores = outputs.logits[:, 1].cpu().numpy()
-        
-        scores.extend(batch_scores)
 
-    for doc, score in zip(retrieved_docs, scores):
-        doc['bert_score'] = float(score)
-    
-    sorted_docs = sorted(retrieved_docs, key=lambda x: x['bert_score'], reverse=True)
+def task1_rerank(
+    query_path: str,
+    bm25_output_file: str,
+    reranked_output_file: str,
+    k: int
+):
+    """
+    Task 1: Retrieve and Rerank using BERT cross-encoder.
+    """
+    print("=" * 80)
+    print("TASK 1: Retrieve and Rerank Framework")
+    print("=" * 80)
 
-    for i, doc in enumerate(sorted_docs[:10]):
-        doc['final_rank'] = i + 1
-    
-    return sorted_docs[:10]
+    # Step 1: Load queries
+    print("\n[1/4] Loading queries...")
+    queries = load_queries(query_path)
+    print(f"Loaded {len(queries)} queries")
 
-def compute_dcg(ranking, qrel_dict, k):
-    """Compute DCG@k"""
-    dcg = 0.0
-    for i in range(min(k, len(ranking))):
-        doc_id = ranking[i]['doc_id']
-        relevance = qrel_dict.get(doc_id, 0)
-        dcg += relevance / np.log2(i + 2)
-    return dcg
+    # Step 2: Initialize BM25 searcher
+    print("\n[2/4] Initializing BM25 searcher...")
+    searcher = LuceneSearcher.from_prebuilt_index('msmarco-v1-passage')
+    print("BM25 searcher ready")
 
-def compute_idcg(qrel_dict, k):
-    """Compute IDCG@k (ideal DCG)"""
-    rel_scores = sorted(qrel_dict.values(), reverse=True)
-    idcg = 0.0
-    for i in range(min(k, len(rel_scores))):
-        idcg += rel_scores[i] / np.log2(i + 2)
-    return idcg
+    # Step 3: Retrieve top-k documents
+    print(f"\n[3/4] Retrieving top-{k} candidates...")
+    bm25_results = retrieve_bm25(searcher, queries, k)
 
-def compute_ndcg(ranking, qrel_dict, k):
-    """Compute NDCG@k"""
-    dcg = compute_dcg(ranking, qrel_dict, k)
-    idcg = compute_idcg(qrel_dict, k)
-    return dcg / idcg if idcg > 0 else 0.0
+    # Write BM25 results
+    bm25_output_dict = {qid: [(doc_id, score) for doc_id, _, score in candidates]
+                        for qid, candidates in bm25_results.items()}
+    write_trec_output(bm25_output_dict, bm25_output_file, run_name="bm25")
+    print(f"BM25 results saved at: {bm25_output_file}")
 
-def compute_mrr(ranking, qrel_dict, k):
-    """Compute MRR@k (Mean Reciprocal Rank)"""
-    for i in range(min(k, len(ranking))):
-        doc_id = ranking[i]['doc_id']
-        if qrel_dict.get(doc_id, 0) > 0:
-            return 1.0 / (i + 1)
-    return 0.0
+    # Step 4: Rerank using BERT Cross-Encoder
+    print("\n[4/4] Reranking with BERT Cross-Encoder...")
+    reranker = BERTReranker(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-print("\n[STEP 7] Running retrieve and rerank evaluation...")
+    reranked_results = {}
+    for qid, qtext in tqdm(queries.items(), desc="Processing queries"):
+        reranked = reranker.rerank(qtext, bm25_results[qid])
+        reranked_results[qid] = reranked
 
-results = {}
+    # Write reranked results
+    write_trec_output(reranked_results, reranked_output_file, run_name="bert_rerank")
+    print(f"Reranked results saved at: {reranked_output_file}")
 
-for k in K_VALUES:
-    print(f"\n{'='*70}")
-    print(f"Evaluating with k={k}")
-    print(f"{'='*70}")
-    
-    results[k] = {
-        'NDCG@1': [],
-        'NDCG@5': [],
-        'NDCG@10': [],
-        'MRR@10': []
-    }
-    
-    query_count = 0
-    start_time = time.time()
-    
-    for query_id in sorted(queries.keys()):
-        query_text = queries[query_id]
+    print("\n" + "=" * 80)
+    print("Task 1 completed successfully!")
+    print("=" * 80)
 
-        if query_id not in qrels:
-            continue
-        
-        query_count += 1
-        
-        try:
 
-            retrieved_docs = retrieve_topk(query_id, query_text, k)
+if __name__ == "__main__":
+    import argparse
 
-            reranked_docs = rerank_with_bert(query_text, retrieved_docs)
+    parser = argparse.ArgumentParser(description="Task 1: Retrieve and Rerank using BERT")
+    parser.add_argument("--query_file_path", type=str, required=True)
+    parser.add_argument("--task1_bm25_output_file", type=str, required=True)
+    parser.add_argument("--reranked_output_file", type=str, required=True)
+    parser.add_argument("--k", type=int, required=True)
 
-            qrel_dict = qrels[query_id]
-            
-            results[k]['NDCG@1'].append(compute_ndcg(reranked_docs, qrel_dict, 1))
-            results[k]['NDCG@5'].append(compute_ndcg(reranked_docs, qrel_dict, 5))
-            results[k]['NDCG@10'].append(compute_ndcg(reranked_docs, qrel_dict, 10))
-            results[k]['MRR@10'].append(compute_mrr(reranked_docs, qrel_dict, 10))
-            
-            if query_count % 5 == 0:
-                elapsed = time.time() - start_time
-                print(f"  Processed {query_count} queries in {elapsed:.2f}s...")
-        
-        except Exception as e:
-            print(f"  Error processing query {query_id}: {e}")
-            continue
-    
-    elapsed = time.time() - start_time
-    print(f"\n✓ Completed {query_count} queries for k={k} in {elapsed:.2f}s")
+    args = parser.parse_args()
 
-print("\n" + "="*70)
-print("RESULTS SUMMARY - RETRIEVE AND RERANK WITH BERT")
-print("="*70)
-
-output_data = {}
-
-for k in K_VALUES:
-    print(f"\nResults for k={k}:")
-    print("-" * 70)
-    
-    for metric in ['NDCG@1', 'NDCG@5', 'NDCG@10', 'MRR@10']:
-        values = results[k][metric]
-        mean_val = np.mean(values)
-        std_val = np.std(values)
-        
-        print(f"{metric:12} : Mean={mean_val:.4f}  Std={std_val:.4f}")
-        
-        if k not in output_data:
-            output_data[k] = {}
-        output_data[k][metric] = {
-            'mean': mean_val,
-            'std': std_val,
-            'values': values
-        }
-
-print("\n[STEP 9] Saving results to file...")
-
-output_file = 'task1_results.json'
-with open(output_file, 'w') as f:
-    data_to_save = {}
-    for k in output_data:
-        data_to_save[str(k)] = {}
-        for metric in output_data[k]:
-            data_to_save[str(k)][metric] = {
-                'mean': float(output_data[k][metric]['mean']),
-                'std': float(output_data[k][metric]['std']),
-                'count': len(output_data[k][metric]['values'])
-            }
-    json.dump(data_to_save, f, indent=2)
-
-print(f"✓ Results saved to {output_file}")
-
-print("\n" + "="*70)
-print("Task 1 completed successfully!")
-print("="*70)
+    task1_rerank(
+        query_path=args.query_file_path,
+        bm25_output_file=args.task1_bm25_output_file,
+        reranked_output_file=args.reranked_output_file,
+        k=args.k,
+    )
